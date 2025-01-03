@@ -8,19 +8,20 @@ import (
 	"os/exec"
 
 	"github.com/crazyfrankie/judge-go/constant"
+	"golang.org/x/sys/unix"
 )
 
 func BaseRun(codeFilename, inputFileName string) error {
 	var errs []string
 
-	// 编译用户代码
+	// Compile user's code
 	cmd := exec.Command("go", "build", codeFilename)
 	err := cmd.Run()
 	if err != nil {
 		return fmt.Errorf("compiling code error: %v", err)
 	}
 
-	// 删除用户代码的可执行文件
+	// Delete user's executables
 	defer func() {
 		er := os.Remove("main")
 		if er != nil {
@@ -28,7 +29,7 @@ func BaseRun(codeFilename, inputFileName string) error {
 		}
 	}()
 
-	// 打开文件准备写入用户代码输出结果
+	// Open file ready to write user code output results
 	inputFile, er := os.OpenFile(inputFileName, os.O_RDWR, 0644)
 	if er != nil {
 		return fmt.Errorf("openning inputfile error: %v", err)
@@ -41,9 +42,9 @@ func BaseRun(codeFilename, inputFileName string) error {
 	}()
 
 	runCmd := exec.Command("./main")
-	// 重定向程序的输出到文件
+	// Redirects the program's output to a file
 	runCmd.Stdout = inputFile
-	// 执行用户代码可执行文件
+	// Execute user code executables
 	err = runCmd.Run()
 	if err != nil {
 		return fmt.Errorf("running user code error: %v", err)
@@ -56,10 +57,10 @@ func BaseRun(codeFilename, inputFileName string) error {
 	return nil
 }
 
-func StdCheck(userInputName, stdInputName string) (int, error) {
+func StdCheck(userOutputPath, stdOutputPath string) (int, error) {
 	var errs []string
 
-	answerFile, err := os.Open(userInputName)
+	answerFile, err := os.Open(userOutputPath)
 	if err != nil {
 		return constant.Fail, fmt.Errorf("opening answer file error: %v", err)
 	}
@@ -70,7 +71,7 @@ func StdCheck(userInputName, stdInputName string) (int, error) {
 		}
 	}()
 
-	stdFile, err := os.Open(stdInputName)
+	stdFile, err := os.Open(stdOutputPath)
 	if err != nil {
 		return constant.Fail, fmt.Errorf("opening answer file error: %v", err)
 	}
@@ -88,12 +89,12 @@ func StdCheck(userInputName, stdInputName string) (int, error) {
 		ans, err1 := answerReader.ReadByte()
 		out, err2 := stdReader.ReadByte()
 
-		// 如果两个文件都到达EOF，内容一致则跳出循环
+		// If both files arrive at EOF and the contents are the same, the loop redirects
 		if err1 == io.EOF && err2 == io.EOF {
 			break
 		}
 
-		// 如果一个文件到达EOF而另一个文件还有内容，返回内容不一致错误
+		// If one file reaches the EOF and another file still has content, an inconsistent content error is returned
 		if err1 == io.EOF && err2 != io.EOF {
 			return constant.Fail, &constant.ContentErr{Msg: fmt.Sprintf("one file ended before the other: err1: %v,err2: %v", err1, err2)}
 		}
@@ -101,12 +102,12 @@ func StdCheck(userInputName, stdInputName string) (int, error) {
 			return constant.Fail, &constant.ContentErr{Msg: fmt.Sprintf("one file ended before the other: err1: %v,err2: %v", err1, err2)}
 		}
 
-		// 如果发生了其他读取错误，直接返回系统错误
+		// If other read errors occur, return the system error directly
 		if err1 != nil || err2 != nil {
 			return constant.Fail, &constant.SystemErr{Msg: fmt.Sprintf("error reading files: err1: %v, err2: %v", err1, err2)}
 		}
 
-		// 如果字节不同，说明内容不一致，返回错误
+		// If the bytes are different, the contents are inconsistent, and an error is returned
 		if ans != out {
 			return constant.Fail, &constant.ContentErr{Msg: "content mismatch"}
 		}
@@ -117,4 +118,45 @@ func StdCheck(userInputName, stdInputName string) (int, error) {
 	}
 
 	return constant.Success, nil
+}
+
+func SetProcStream(inputFilePath, outputFilePath, errorFilePath string) error {
+	// set input stream
+	if inputFilePath != "" {
+		// open input file
+		if fd, err := unix.Open(inputFilePath, unix.O_RDONLY, 0666); err != nil {
+			return err
+		} else {
+			// dup pipe
+			if err := unix.Dup2(fd, unix.Stdin); err != nil {
+				return err
+			}
+		}
+	}
+
+	// set output stream
+	if outputFilePath != "" {
+		// open file
+		if fd, err := unix.Open(outputFilePath, unix.O_WRONLY|unix.O_CREAT, 0666); err != nil {
+			return err
+		} else {
+			// dup pipe
+			if err := unix.Dup2(fd, unix.Stdout); err != nil {
+				return err
+			}
+		}
+	}
+
+	// set error stream
+	if errorFilePath != "" {
+		if fd, err := unix.Open(errorFilePath, unix.O_WRONLY|unix.O_CREAT, 0666); err != nil {
+			return err
+		} else {
+			if err := unix.Dup2(fd, unix.Stderr); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
