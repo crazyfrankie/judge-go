@@ -7,12 +7,10 @@ import (
 	"os"
 	"os/exec"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/crazyfrankie/judge-go/constant"
 )
 
-func BaseRun(cgroupPath string, limit *Limit, Uid uint64, Gid uint64, codeFilename, inputFileName string) error {
+func BaseRun(cgroupPath string, limit *Limit, codeFilename, inputFileName string) error {
 	var errs []string
 
 	// Compile user's code
@@ -31,19 +29,19 @@ func BaseRun(cgroupPath string, limit *Limit, Uid uint64, Gid uint64, codeFilena
 	}()
 
 	// Open file ready to write user code output results
-	inputFile, er := os.OpenFile(inputFileName, os.O_RDWR, 0644)
+	useroutFile, er := os.OpenFile(inputFileName, os.O_RDWR, 0644)
 	if er != nil {
 		return fmt.Errorf("openning inputfile error: %v", err)
 	}
 	defer func() {
-		closeErr := inputFile.Close()
+		closeErr := useroutFile.Close()
 		if closeErr != nil {
 			errs = append(errs, fmt.Sprintf("failed to close input file: %v", closeErr))
 		}
 	}()
 
 	// set resource limit and create a isolated environment
-	if err := limitAndIsolate(cgroupPath, limit, int(Uid), int(Gid)); err != nil {
+	if err := limitAndIsolate(cgroupPath, limit); err != nil {
 		return fmt.Errorf("failed to set resource limits: %v", err)
 	}
 	defer func() {
@@ -60,7 +58,7 @@ func BaseRun(cgroupPath string, limit *Limit, Uid uint64, Gid uint64, codeFilena
 
 	runCmd := exec.Command("./main")
 	// Redirects the program's output to a file
-	runCmd.Stdout = inputFile
+	runCmd.Stdout = useroutFile
 	// Execute user code executables
 	err = runCmd.Run()
 	if err != nil {
@@ -135,45 +133,4 @@ func StdCheck(userOutputPath, stdOutputPath string) (int, error) {
 	}
 
 	return constant.Success, nil
-}
-
-func SetProcStream(inputFilePath, outputFilePath, errorFilePath string) error {
-	// set input stream
-	if inputFilePath != "" {
-		// open input file
-		if fd, err := unix.Open(inputFilePath, unix.O_RDONLY, 0666); err != nil {
-			return err
-		} else {
-			// dup pipe
-			if err := unix.Dup2(fd, unix.Stdin); err != nil {
-				return err
-			}
-		}
-	}
-
-	// set output stream
-	if outputFilePath != "" {
-		// open file
-		if fd, err := unix.Open(outputFilePath, unix.O_WRONLY|unix.O_CREAT, 0666); err != nil {
-			return err
-		} else {
-			// dup pipe
-			if err := unix.Dup2(fd, unix.Stdout); err != nil {
-				return err
-			}
-		}
-	}
-
-	// set error stream
-	if errorFilePath != "" {
-		if fd, err := unix.Open(errorFilePath, unix.O_WRONLY|unix.O_CREAT, 0666); err != nil {
-			return err
-		} else {
-			if err := unix.Dup2(fd, unix.Stderr); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
 }

@@ -84,42 +84,21 @@ func enterNamespace() error {
 	return nil
 }
 
-func setProUser(uid, gid int) error {
-	// set user id
-	if uid != 0 {
-		if err := unix.Setuid(uid); err != nil {
-			return err
-		}
-	}
-
-	// set user group id
-	if gid != 0 {
-		if err := unix.Setgid(gid); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 func limitSysCall() error {
 	sec, err := seccomp.NewFilter(seccomp.ActAllow)
 	if err != nil {
 		return err
 	}
 
-	err = sec.AddArch(seccomp.ArchNative)
+	err = sec.AddArch(seccomp.ArchAMD64)
 	if err != nil {
 		return err
 	}
 
-	// read write mmap fork execve ptrace openat
-	syscallsBlock := []int32{0, 1, 9, 41, 56, 57, 59, 101, 257}
-
-	for _, syscall := range syscallsBlock {
-		if err := sec.AddRule(seccomp.ScmpSyscall(syscall), seccomp.ActKillThread); err != nil {
-			return err
-		}
+	// forbid fork
+	err = sec.AddRule(57, seccomp.ActKillThread)
+	if err != nil {
+		return err
 	}
 
 	if err := sec.Load(); err != nil {
@@ -129,7 +108,7 @@ func limitSysCall() error {
 	return nil
 }
 
-func limitAndIsolate(cgroupPath string, limit *Limit, uid int, gid int) error {
+func limitAndIsolate(cgroupPath string, limit *Limit) error {
 	// create a Cgroup to limit processes
 	if err := createCgroup(cgroupPath, limit); err != nil {
 		return fmt.Errorf("failed to create cgroup: %v", err)
@@ -146,11 +125,6 @@ func limitAndIsolate(cgroupPath string, limit *Limit, uid int, gid int) error {
 	// use Namespace isolate processes
 	if err := enterNamespace(); err != nil {
 		return fmt.Errorf("failed to enter namespace: %v", err)
-	}
-
-	// set user and group
-	if err := setProUser(uid, gid); err != nil {
-		return fmt.Errorf("failed to set process user: %v", err)
 	}
 
 	return nil
