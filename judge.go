@@ -7,11 +7,12 @@ import (
 	"os"
 	"os/exec"
 
-	"github.com/crazyfrankie/judge-go/constant"
 	"golang.org/x/sys/unix"
+
+	"github.com/crazyfrankie/judge-go/constant"
 )
 
-func BaseRun(codeFilename, inputFileName string) error {
+func BaseRun(cgroupPath string, limit *Limit, Uid uint64, Gid uint64, codeFilename, inputFileName string) error {
 	var errs []string
 
 	// Compile user's code
@@ -40,6 +41,22 @@ func BaseRun(codeFilename, inputFileName string) error {
 			errs = append(errs, fmt.Sprintf("failed to close input file: %v", closeErr))
 		}
 	}()
+
+	// set resource limit and create a isolated environment
+	if err := limitAndIsolate(cgroupPath, limit, int(Uid), int(Gid)); err != nil {
+		return fmt.Errorf("failed to set resource limits: %v", err)
+	}
+	defer func() {
+		// delete Cgroup
+		if err := os.RemoveAll(cgroupPath); err != nil {
+			errs = append(errs, fmt.Sprintf("failed to clean up cgroup: %v", err))
+		}
+	}()
+
+	// Apply seccomp to limit system calls
+	if err := limitSysCall(); err != nil {
+		return fmt.Errorf("failed to apply seccomp: %v", err)
+	}
 
 	runCmd := exec.Command("./main")
 	// Redirects the program's output to a file
