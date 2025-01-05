@@ -12,6 +12,7 @@ import (
 
 type Limit struct {
 	CpuTime    int
+	RealTime   int
 	Memory     int
 	Stack      int
 	OutputSize int
@@ -84,27 +85,20 @@ func enterNamespace() error {
 	return nil
 }
 
-func limitSysCall() error {
-	sec, err := seccomp.NewFilter(seccomp.ActAllow)
-	if err != nil {
-		return err
+func setProcUser(uid int, gid int) error {
+	// set uid
+	if uid != 0 {
+		if err := unix.Setuid(uid); err != nil {
+			return err
+		}
 	}
 
-	err = sec.AddArch(seccomp.ArchAMD64)
-	if err != nil {
-		return err
+	// set gid
+	if gid != 0 {
+		if err := unix.Setgid(gid); err != nil {
+			return err
+		}
 	}
-
-	// forbid fork
-	err = sec.AddRule(57, seccomp.ActKillThread)
-	if err != nil {
-		return err
-	}
-
-	if err := sec.Load(); err != nil {
-		return fmt.Errorf("failed to load seccomp filter: %v", err)
-	}
-
 	return nil
 }
 
@@ -125,6 +119,36 @@ func limitAndIsolate(cgroupPath string, limit *Limit) error {
 	// use Namespace isolate processes
 	if err := enterNamespace(); err != nil {
 		return fmt.Errorf("failed to enter namespace: %v", err)
+	}
+
+	return nil
+}
+
+func applySeccomp(syscallRule []bool) error {
+	if syscallRule == nil {
+		syscallRule = make([]bool, 512)
+		for i := range syscallRule {
+			syscallRule[i] = true
+		}
+	}
+
+	filter, err := seccomp.NewFilter(seccomp.ActAllow)
+	if err != nil {
+		return fmt.Errorf("error creating seccomp filter: %v", err)
+	}
+
+	for i, allowed := range syscallRule {
+		if !allowed {
+			err = filter.AddRule(seccomp.ScmpSyscall(i), seccomp.ActErrno)
+			if err != nil {
+				return fmt.Errorf("error adding rule to seccomp filter for syscall %d: %v", i, err)
+			}
+		}
+	}
+
+	err = filter.Load()
+	if err != nil {
+		return fmt.Errorf("error loading seccomp filter: %v", err)
 	}
 
 	return nil

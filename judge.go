@@ -2,74 +2,187 @@ package judge
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
+	"strconv"
+	"sync"
+	"time"
 
 	"github.com/crazyfrankie/judge-go/constant"
+	"golang.org/x/sys/unix"
 )
 
-func BaseRun(cgroupPath string, limit *Limit, codeFilename, inputFileName string) error {
-	var errs []string
+func BaseRun(limit *Limit, cgroupPath, userOutputPath, execFilePath string, execArgs, envs []string, syscallRule []bool, uid, gid int, chroot string) (Result, error) {
+	// Lock the current thread to ensure that the current thread is not migrated during execution
+	runtime.LockOSThread()
+	// Unlock at the end of the function
+	defer runtime.UnlockOSThread()
 
-	// Compile user's code
-	cmd := exec.Command("go", "build", codeFilename)
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("compiling code error: %v", err)
-	}
+	var result Result
+	var status unix.WaitStatus
+	var ru unix.Rusage
 
-	// Delete user's executables
-	defer func() {
-		er := os.Remove("main")
+	// start time
+	startTime := time.Now().UnixMilli()
+
+	// Ensure that only one process can create child processes
+	var ForkLock sync.RWMutex
+	ForkLock.Lock()
+
+	// Create child process
+	pid, _, _ := unix.Syscall(unix.SYS_FORK, 0, 0, 0)
+
+	if pid < 0 {
+		// Fork error
+		return result, errors.New("fork failure")
+	} else {
+		// Child process
+		var errs []string
+		// Set limitation and isolation
+		if err := limitAndIsolate(cgroupPath, limit); err != nil {
+			panic(err)
+		}
+		defer func() {
+			// Delete Cgroup
+			if err := os.RemoveAll(cgroupPath); err != nil {
+				errs = append(errs, fmt.Sprintf("failed to clean up cgroup: %v", err))
+			}
+		}()
+
+		// if err := setProcUser(uid, gid); err != nil {
+		// 	panic(err)
+		// }
+
+		// // Change the root directory of the process
+		// if chroot != "" {
+		// 	if err := unix.Chroot(chroot); err != nil {
+		// 		panic(err)
+		// 	}
+		// }
+
+		// Open user's output file
+		useroutFile, er := os.OpenFile(userOutputPath, os.O_RDWR, 0644)
 		if er != nil {
-			errs = append(errs, er.Error())
+			return result, fmt.Errorf("openning inputfile error: %v", er)
 		}
-	}()
+		defer func() {
+			closeErr := useroutFile.Close()
+			if closeErr != nil {
+				errs = append(errs, fmt.Sprintf("failed to close input file: %v", closeErr))
+			}
+		}()
 
-	// Open file ready to write user code output results
-	useroutFile, er := os.OpenFile(inputFileName, os.O_RDWR, 0644)
-	if er != nil {
-		return fmt.Errorf("openning inputfile error: %v", err)
-	}
-	defer func() {
-		closeErr := useroutFile.Close()
-		if closeErr != nil {
-			errs = append(errs, fmt.Sprintf("failed to close input file: %v", closeErr))
+		// Apply seccomp for syscall restrictions
+		if err := applySeccomp(syscallRule); err != nil {
+			panic(err)
 		}
-	}()
 
-	// set resource limit and create a isolated environment
-	if err := limitAndIsolate(cgroupPath, limit); err != nil {
-		return fmt.Errorf("failed to set resource limits: %v", err)
-	}
-	defer func() {
-		// delete Cgroup
-		if err := os.RemoveAll(cgroupPath); err != nil {
-			errs = append(errs, fmt.Sprintf("failed to clean up cgroup: %v", err))
+		// Exec run
+		cmd := exec.Command(execArgs[0], append(execArgs[1:], execFilePath)...)
+		// set args
+		cmd.Env = envs
+		cmd.Stdout = useroutFile
+		err := cmd.Run()
+		if err != nil {
+			return result, err
 		}
-	}()
 
-	// Apply seccomp to limit system calls
-	if err := limitSysCall(); err != nil {
-		return fmt.Errorf("failed to apply seccomp: %v", err)
+		// You will never arrive here
+		unix.Exit(-1)
+	}
+	// Release the parent process's ForkLock lock
+	ForkLock.Unlock()
+
+	// Parent
+
+	// Set real time limit
+	stop := make(chan struct{})
+	// If a time limit is set, a timer is created
+	// Determine if the child process exits after a period of time
+	if limit.RealTime != 0 {
+		ticker := time.NewTicker(time.Millisecond * time.Duration(limit.RealTime))
+		go func() {
+			defer ticker.Stop()
+
+			select {
+			case <-ticker.C:
+				// The child process timed out
+				// If the child process is still running, send the SIGKILL signal to terminate it
+				ret, _ := unix.Wait4(int(pid), &status, unix.WNOHANG, &ru)
+				if ret == 0 {
+					_ = unix.Kill(int(pid), unix.SIGKILL)
+				}
+			case <-stop:
+				return
+			}
+		}()
 	}
 
-	runCmd := exec.Command("./main")
-	// Redirects the program's output to a file
-	runCmd.Stdout = useroutFile
-	// Execute user code executables
-	err = runCmd.Run()
+	// Open the /proc/[pid]/status file of the child process for memory usage
+	fd, err := unix.Open("/proc/"+strconv.Itoa(int(pid))+"/status", unix.O_RDONLY, 600)
 	if err != nil {
-		return fmt.Errorf("running user code error: %v", err)
+		return result, err
+	}
+	defer unix.Close(fd)
+
+	var regs unix.PtraceRegs
+	for {
+		// Wait for the child process to pause and obtain the status
+		if _, err := unix.Wait4(int(pid), &status, unix.WSTOPPED, &ru); err != nil {
+			return result, err
+		}
+
+		// If the child process exits, the loop exits
+		if status.Exited() {
+			break
+		}
+
+		// If the child process pause signal is not SIGTRAP, the pause is not caused by ptrace
+		if status.StopSignal() != unix.SIGTRAP {
+			_, _, _ = unix.Syscall(unix.SYS_PTRACE, uintptr(unix.PTRACE_KILL), 0, 0)
+			_, _ = unix.Wait4(int(pid), nil, 0, nil)
+			result.ReFlag = true
+			break
+		}
+
+		// Gets register information for the child process
+		if err := unix.PtraceGetRegs(int(pid), &regs); err != nil {
+			return result, err
+		}
+
+		// Gets the memory usage of the child process
+		if ms, err := MemoryUsage(fd); err != nil {
+			return result, err
+		} else if ms.VMData > result.MemoryUsed {
+			result.MemoryUsed = ms.VMData
+		}
+
+		// Let the child continue executing and wait for the next system call
+		if err := unix.PtraceSyscall(int(pid), 0); err != nil {
+			return result, err
+		}
 	}
 
-	if len(errs) > 0 {
-		return fmt.Errorf("cleaning up error: %v", errs)
-	}
+	// Stop the timer to end the time limit check
+	stop <- struct{}{}
 
-	return nil
+	// cpu time used
+	// user time + system time
+	result.CpuTimeUsed = int(ru.Utime.Sec*1000) + int(ru.Utime.Usec/1000) +
+		int(ru.Stime.Sec*1000) + int(ru.Stime.Usec/1000)
+
+	// real time used
+	endTime := time.Now().UnixMilli()
+	result.RealTimeUsed = int(endTime - startTime)
+
+	// Records the signal received by the process
+	result.Signal = int(status.StopSignal())
+
+	return result, nil
 }
 
 func StdCheck(userOutputPath, stdOutputPath string) (int, error) {
@@ -133,4 +246,8 @@ func StdCheck(userOutputPath, stdOutputPath string) (int, error) {
 	}
 
 	return constant.Success, nil
+}
+
+func AllowSyscall(syscallRule []bool, syscallId uint64) bool {
+	return syscallRule[int(syscallId)]
 }
