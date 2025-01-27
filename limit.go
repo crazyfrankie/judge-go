@@ -26,17 +26,17 @@ func createCgroup(cgroupPath string, limit *Limit) error {
 		return fmt.Errorf("failed to create cgroup directory: %v", err)
 	}
 
-	// cpu time limit (MS)
+	// cpu time limit (μS)
 	if limit.CpuTime > 0 {
 		cpuLimit := limit.CpuTime * 1000
-		if err := os.WriteFile(cgroupPath+"/cpu.cfs_quota_us", []byte(strconv.Itoa(cpuLimit)), 0644); err != nil {
+		if err := os.WriteFile(cgroupPath+"/cpu.max", []byte(fmt.Sprintf("%d 100000", cpuLimit)), 0644); err != nil {
 			return fmt.Errorf("failed to set cpu limit: %v", err)
 		}
 	}
 
 	// memory limit (KB)
 	if limit.Memory > 0 {
-		if err := os.WriteFile(cgroupPath+"/memory.limit_in_bytes", []byte(strconv.Itoa(limit.Memory*1024)), 0644); err != nil {
+		if err := os.WriteFile(cgroupPath+"/memory.max", []byte(strconv.Itoa(limit.Memory*1024)), 0644); err != nil {
 			return fmt.Errorf("failed to set memory limit: %v", err)
 		}
 	}
