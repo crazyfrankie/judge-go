@@ -1,253 +1,233 @@
 package judge
 
 import (
-	"bufio"
-	"errors"
+	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
-	"runtime"
-	"strconv"
 	"sync"
+	"syscall"
 	"time"
-
-	"github.com/crazyfrankie/judge-go/constant"
-	"golang.org/x/sys/unix"
 )
 
-func BaseRun(limit *Limit, cgroupPath, userOutputPath, execFilePath string, execArgs, envs []string, syscallRule []bool, uid, gid int, chroot string) (Result, error) {
-	// Lock the current thread to ensure that the current thread is not migrated during execution
-	runtime.LockOSThread()
-	// Unlock at the end of the function
-	defer runtime.UnlockOSThread()
-
-	var result Result
-	var status unix.WaitStatus
-	var ru unix.Rusage
-
-	// start time
-	startTime := time.Now().UnixMilli()
-
-	// Ensure that only one process can create child processes
-	var ForkLock sync.RWMutex
-	ForkLock.Lock()
-
-	// Create child process
-	pid, _, _ := unix.Syscall(unix.SYS_FORK, 0, 0, 0)
-
-	if pid < 0 {
-		// Fork error
-		return result, errors.New("fork failure")
-	} else {
-		// Child process
-		var errs []string
-		// Set limitation and isolation
-		if err := limitAndIsolate(cgroupPath, limit); err != nil {
-			panic(err)
-		}
-		defer func() {
-			// Delete Cgroup
-			if err := os.RemoveAll(cgroupPath); err != nil {
-				errs = append(errs, fmt.Sprintf("failed to clean up cgroup: %v", err))
-			}
-		}()
-
-		// if err := setProcUser(uid, gid); err != nil {
-		// 	panic(err)
-		// }
-
-		// // Change the root directory of the process
-		// if chroot != "" {
-		// 	if err := unix.Chroot(chroot); err != nil {
-		// 		panic(err)
-		// 	}
-		// }
-
-		// Open user's output file
-		useroutFile, er := os.OpenFile(userOutputPath, os.O_RDWR, 0644)
-		if er != nil {
-			return result, fmt.Errorf("openning inputfile error: %v", er)
-		}
-		defer func() {
-			closeErr := useroutFile.Close()
-			if closeErr != nil {
-				errs = append(errs, fmt.Sprintf("failed to close input file: %v", closeErr))
-			}
-		}()
-
-		// Apply seccomp for syscall restrictions
-		if err := applySeccomp(syscallRule); err != nil {
-			panic(err)
-		}
-
-		// Exec run
-		cmd := exec.Command(execArgs[0], append(execArgs[1:], execFilePath)...)
-		// set args
-		cmd.Env = envs
-		cmd.Stdout = useroutFile
-		err := cmd.Run()
-		if err != nil {
-			return result, err
-		}
-
-		// You will never arrive here
-		unix.Exit(-1)
-	}
-	// Release the parent process's ForkLock lock
-	ForkLock.Unlock()
-
-	// Parent
-
-	// Set real time limit
-	stop := make(chan struct{})
-	// If a time limit is set, a timer is created
-	// Determine if the child process exits after a period of time
-	if limit.RealTime != 0 {
-		ticker := time.NewTicker(time.Millisecond * time.Duration(limit.RealTime))
-		go func() {
-			defer ticker.Stop()
-
-			select {
-			case <-ticker.C:
-				// The child process timed out
-				// If the child process is still running, send the SIGKILL signal to terminate it
-				ret, _ := unix.Wait4(int(pid), &status, unix.WNOHANG, &ru)
-				if ret == 0 {
-					_ = unix.Kill(int(pid), unix.SIGKILL)
-				}
-			case <-stop:
-				return
-			}
-		}()
-	}
-
-	// Open the /proc/[pid]/status file of the child process for memory usage
-	fd, err := unix.Open("/proc/"+strconv.Itoa(int(pid))+"/status", unix.O_RDONLY, 600)
-	if err != nil {
-		return result, err
-	}
-	defer unix.Close(fd)
-
-	var regs unix.PtraceRegs
-	for {
-		// Wait for the child process to pause and obtain the status
-		if _, err := unix.Wait4(int(pid), &status, unix.WSTOPPED, &ru); err != nil {
-			return result, err
-		}
-
-		// If the child process exits, the loop exits
-		if status.Exited() {
-			break
-		}
-
-		// If the child process pause signal is not SIGTRAP, the pause is not caused by ptrace
-		if status.StopSignal() != unix.SIGTRAP {
-			_, _, _ = unix.Syscall(unix.SYS_PTRACE, uintptr(unix.PTRACE_KILL), 0, 0)
-			_, _ = unix.Wait4(int(pid), nil, 0, nil)
-			result.ReFlag = true
-			break
-		}
-
-		// Gets register information for the child process
-		if err := unix.PtraceGetRegs(int(pid), &regs); err != nil {
-			return result, err
-		}
-
-		// Gets the memory usage of the child process
-		if ms, err := MemoryUsage(fd); err != nil {
-			return result, err
-		} else if ms.VMData > result.MemoryUsed {
-			result.MemoryUsed = ms.VMData
-		}
-
-		// Let the child continue executing and wait for the next system call
-		if err := unix.PtraceSyscall(int(pid), 0); err != nil {
-			return result, err
-		}
-	}
-
-	// Stop the timer to end the time limit check
-	stop <- struct{}{}
-
-	// cpu time used
-	// user time + system time
-	result.CpuTimeUsed = int(ru.Utime.Sec*1000) + int(ru.Utime.Usec/1000) +
-		int(ru.Stime.Sec*1000) + int(ru.Stime.Usec/1000)
-
-	// real time used
-	endTime := time.Now().UnixMilli()
-	result.RealTimeUsed = int(endTime - startTime)
-
-	// Records the signal received by the process
-	result.Signal = int(status.StopSignal())
-
-	return result, nil
+// Judge 表示一个评测实例
+type Judge struct {
+	config *Config
+	result *Result
+	mu     sync.Mutex
+	done   chan struct{}
 }
 
-func StdCheck(userOutputPath, stdOutputPath string) (int, error) {
-	var errs []string
-
-	answerFile, err := os.Open(userOutputPath)
-	if err != nil {
-		return constant.Fail, fmt.Errorf("opening answer file error: %v", err)
+// Config 评测配置
+type Config struct {
+	// 资源限制
+	Limits struct {
+		CPU    time.Duration
+		Memory int64
+		Stack  int64
+		Output int64
 	}
-	defer func() {
-		err := answerFile.Close()
-		if err != nil {
-			errs = append(errs, err.Error())
-		}
-	}()
-
-	stdFile, err := os.Open(stdOutputPath)
-	if err != nil {
-		return constant.Fail, fmt.Errorf("opening answer file error: %v", err)
+	// 执行配置
+	Exec struct {
+		Path string
+		Args []string
+		Env  []string
 	}
-	defer func() {
-		err := stdFile.Close()
-		if err != nil {
-			errs = append(errs, err.Error())
-		}
-	}()
+	// 安全配置
+	Security struct {
+		UID      int
+		GID      int
+		Chroot   string
+		Syscalls []bool
+	}
+	// 文件配置
+	Files struct {
+		UserOutput string
+		StdOutput  string
+		CgroupPath string
+	}
+}
 
-	answerReader := bufio.NewReader(answerFile)
-	stdReader := bufio.NewReader(stdFile)
+// NewJudge 创建一个新的评测实例
+func NewJudge(config *Config) *Judge {
+	return &Judge{
+		config: config,
+		result: &Result{},
+		done:   make(chan struct{}),
+	}
+}
+
+// Run 执行评测
+func (j *Judge) Run(ctx context.Context) (*Result, error) {
+	// 创建带超时的上下文
+	ctx, cancel := context.WithTimeout(ctx, j.config.Limits.CPU)
+	defer cancel()
+
+	// 创建命令
+	cmd := exec.CommandContext(ctx, j.config.Exec.Path, j.config.Exec.Args...)
+	cmd.Env = j.config.Exec.Env
+
+	// 设置输出
+	outputFile, err := os.Create(j.config.Files.UserOutput)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer outputFile.Close()
+	cmd.Stdout = outputFile
+
+	// 启动进程
+	if err := j.startProcess(cmd); err != nil {
+		return nil, err
+	}
+
+	// 等待进程结束
+	if err := j.waitProcess(cmd); err != nil {
+		return nil, err
+	}
+
+	return j.result, nil
+}
+
+// startProcess 启动进程并设置资源限制
+func (j *Judge) startProcess(cmd *exec.Cmd) error {
+	// 设置资源限制
+	if err := j.setupResourceLimits(cmd); err != nil {
+		return err
+	}
+
+	// 设置安全限制
+	if err := j.setupSecurity(cmd); err != nil {
+		return err
+	}
+
+	// 启动进程
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start process: %w", err)
+	}
+
+	return nil
+}
+
+// waitProcess 等待进程结束并收集结果
+func (j *Judge) waitProcess(cmd *exec.Cmd) error {
+	startTime := time.Now().UnixMilli()
+
+	// 启动goroutine监控内存使用
+	go j.monitorMemory(cmd.Process.Pid)
+
+	// 等待进程结束
+	err := cmd.Wait()
+	endTime := time.Now().UnixMilli()
+
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			j.result.Signal = exitErr.ExitCode()
+			return nil
+		}
+		return fmt.Errorf("process error: %w", err)
+	}
+
+	// 更新时间统计
+	j.result.RealTimeUsed = endTime - startTime
+
+	// 获取资源使用情况
+	if rusage, ok := cmd.ProcessState.SysUsage().(*syscall.Rusage); ok {
+		j.result.CpuTimeUsed = int64(rusage.Utime.Sec)*1000 +
+			int64(rusage.Utime.Usec)/1000 +
+			int64(rusage.Stime.Sec)*1000 +
+			int64(rusage.Stime.Usec)/1000
+	}
+
+	return nil
+}
+
+// setupResourceLimits 设置资源限制
+func (j *Judge) setupResourceLimits(cmd *exec.Cmd) error {
+	// 设置cgroup
+	if err := j.setupCgroup(); err != nil {
+		return err
+	}
+
+	// 设置栈大小限制
+	if j.config.Limits.Stack > 0 {
+		if err := syscall.Setrlimit(syscall.RLIMIT_STACK, &syscall.Rlimit{
+			Cur: uint64(j.config.Limits.Stack),
+			Max: uint64(j.config.Limits.Stack),
+		}); err != nil {
+			return fmt.Errorf("failed to set stack limit: %w", err)
+		}
+	}
+
+	// 设置输出大小限制
+	if j.config.Limits.Output > 0 {
+		if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &syscall.Rlimit{
+			Cur: uint64(j.config.Limits.Output),
+			Max: uint64(j.config.Limits.Output),
+		}); err != nil {
+			return fmt.Errorf("failed to set output size limit: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// setupSecurity 设置安全限制
+func (j *Judge) setupSecurity(cmd *exec.Cmd) error {
+	// 设置seccomp
+	if err := j.setupSeccomp(); err != nil {
+		return err
+	}
+
+	// 设置用户和组ID
+	if j.config.Security.UID != 0 || j.config.Security.GID != 0 {
+		cmd.SysProcAttr.Credential = &syscall.Credential{
+			Uid: uint32(j.config.Security.UID),
+			Gid: uint32(j.config.Security.GID),
+		}
+	}
+
+	return nil
+}
+
+// monitorMemory 监控内存使用
+func (j *Judge) monitorMemory(pid int) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
 
 	for {
-		ans, err1 := answerReader.ReadByte()
-		out, err2 := stdReader.ReadByte()
-
-		// If both files arrive at EOF and the contents are the same, the loop redirects
-		if err1 == io.EOF && err2 == io.EOF {
-			break
-		}
-
-		// If one file reaches the EOF and another file still has content, an inconsistent content error is returned
-		if err1 == io.EOF && err2 != io.EOF {
-			return constant.Fail, &constant.ContentErr{Msg: fmt.Sprintf("one file ended before the other: err1: %v,err2: %v", err1, err2)}
-		}
-		if err2 == io.EOF && err1 != io.EOF {
-			return constant.Fail, &constant.ContentErr{Msg: fmt.Sprintf("one file ended before the other: err1: %v,err2: %v", err1, err2)}
-		}
-
-		// If other read errors occur, return the system error directly
-		if err1 != nil || err2 != nil {
-			return constant.Fail, &constant.SystemErr{Msg: fmt.Sprintf("error reading files: err1: %v, err2: %v", err1, err2)}
-		}
-
-		// If the bytes are different, the contents are inconsistent, and an error is returned
-		if ans != out {
-			return constant.Fail, &constant.ContentErr{Msg: "content mismatch"}
+		select {
+		case <-j.done:
+			return
+		case <-ticker.C:
+			if usage, err := getMemoryUsage(pid); err == nil {
+				j.mu.Lock()
+				if usage > j.result.MemoryUsed {
+					j.result.MemoryUsed = usage
+				}
+				j.mu.Unlock()
+			}
 		}
 	}
+}
 
-	if len(errs) > 0 {
-		return constant.Fail, &constant.SystemErr{Msg: "close files error"}
-	}
+// Check 检查输出结果
+func (j *Judge) Check() (int, error) {
+	return StdCheck(j.config.Files.UserOutput, j.config.Files.StdOutput)
+}
 
-	return constant.Success, nil
+// Close 清理资源
+func (j *Judge) Close() error {
+	close(j.done)
+	return os.RemoveAll(j.config.Files.CgroupPath)
 }
 
 func AllowSyscall(syscallRule []bool, syscallId uint64) bool {
 	return syscallRule[int(syscallId)]
+}
+
+// 修改时间相关的类型转换
+func (j *Judge) updateTimes(startTime, endTime int64, ru *syscall.Rusage) {
+	j.result.CpuTimeUsed = int64(ru.Utime.Sec)*1000 + int64(ru.Utime.Usec)/1000 +
+		int64(ru.Stime.Sec)*1000 + int64(ru.Stime.Usec)/1000
+	j.result.RealTimeUsed = endTime - startTime
 }
