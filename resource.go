@@ -3,45 +3,11 @@ package judge
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
 	seccomp "github.com/seccomp/libseccomp-golang"
 )
-
-// setupCgroup 设置cgroup限制
-func (j *Judge) setupCgroup() error {
-	// 创建cgroup目录
-	if err := os.MkdirAll(j.config.Files.CgroupPath, 0755); err != nil {
-		return fmt.Errorf("failed to create cgroup directory: %w", err)
-	}
-
-	// 设置CPU限制
-	if j.config.Limits.CPU > 0 {
-		cpuLimit := j.config.Limits.CPU.Microseconds()
-		if err := os.WriteFile(
-			filepath.Join(j.config.Files.CgroupPath, "cpu.max"),
-			[]byte(fmt.Sprintf("%d 100000", cpuLimit)),
-			0644,
-		); err != nil {
-			return fmt.Errorf("failed to set cpu limit: %w", err)
-		}
-	}
-
-	// 设置内存限制
-	if j.config.Limits.Memory > 0 {
-		if err := os.WriteFile(
-			filepath.Join(j.config.Files.CgroupPath, "memory.max"),
-			[]byte(strconv.FormatInt(j.config.Limits.Memory*1024, 10)),
-			0644,
-		); err != nil {
-			return fmt.Errorf("failed to set memory limit: %w", err)
-		}
-	}
-
-	return nil
-}
 
 // setupSeccomp 设置seccomp限制
 func (j *Judge) setupSeccomp() error {

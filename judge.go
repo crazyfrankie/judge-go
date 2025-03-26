@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -63,6 +65,9 @@ func (j *Judge) Run(ctx context.Context) (*Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, j.config.Limits.CPU)
 	defer cancel()
 
+	// 确保资源清理
+	defer j.Close()
+
 	// 创建命令
 	cmd := exec.CommandContext(ctx, j.config.Exec.Path, j.config.Exec.Args...)
 	cmd.Env = j.config.Exec.Env
@@ -74,6 +79,7 @@ func (j *Judge) Run(ctx context.Context) (*Result, error) {
 	}
 	defer outputFile.Close()
 	cmd.Stdout = outputFile
+	cmd.Stderr = outputFile // 也捕获错误输出
 
 	// 启动进程
 	if err := j.startProcess(cmd); err != nil {
@@ -148,7 +154,19 @@ func (j *Judge) setupResourceLimits(cmd *exec.Cmd) error {
 		return err
 	}
 
-	// 设置栈大小限制
+	var oldStackLimit, oldFileLimit syscall.Rlimit
+	if j.config.Limits.Stack > 0 {
+		if err := syscall.Getrlimit(syscall.RLIMIT_STACK, &oldStackLimit); err != nil {
+			return fmt.Errorf("failed to get stack limit: %w", err)
+		}
+	}
+	if j.config.Limits.Output > 0 {
+		if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &oldFileLimit); err != nil {
+			return fmt.Errorf("failed to get file size limit: %w", err)
+		}
+	}
+
+	// 在进程启动前设置资源限制
 	if j.config.Limits.Stack > 0 {
 		if err := syscall.Setrlimit(syscall.RLIMIT_STACK, &syscall.Rlimit{
 			Cur: uint64(j.config.Limits.Stack),
@@ -156,16 +174,19 @@ func (j *Judge) setupResourceLimits(cmd *exec.Cmd) error {
 		}); err != nil {
 			return fmt.Errorf("failed to set stack limit: %w", err)
 		}
+		// 执行后恢复原有限制
+		defer syscall.Setrlimit(syscall.RLIMIT_STACK, &oldStackLimit)
 	}
 
-	// 设置输出大小限制
 	if j.config.Limits.Output > 0 {
 		if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &syscall.Rlimit{
 			Cur: uint64(j.config.Limits.Output),
 			Max: uint64(j.config.Limits.Output),
 		}); err != nil {
-			return fmt.Errorf("failed to set output size limit: %w", err)
+			return fmt.Errorf("failed to set file size limit: %w", err)
 		}
+		// 执行后恢复原有限制
+		defer syscall.Setrlimit(syscall.RLIMIT_FSIZE, &oldFileLimit)
 	}
 
 	return nil
@@ -230,4 +251,37 @@ func (j *Judge) updateTimes(startTime, endTime int64, ru *syscall.Rusage) {
 	j.result.CpuTimeUsed = int64(ru.Utime.Sec)*1000 + int64(ru.Utime.Usec)/1000 +
 		int64(ru.Stime.Sec)*1000 + int64(ru.Stime.Usec)/1000
 	j.result.RealTimeUsed = endTime - startTime
+}
+
+// setupCgroup 设置cgroup限制
+func (j *Judge) setupCgroup() error {
+	// 创建cgroup目录
+	if err := os.MkdirAll(j.config.Files.CgroupPath, 0755); err != nil {
+		return fmt.Errorf("failed to create cgroup directory: %w", err)
+	}
+
+	// 设置CPU限制
+	if j.config.Limits.CPU > 0 {
+		cpuLimit := j.config.Limits.CPU.Microseconds()
+		if err := os.WriteFile(
+			filepath.Join(j.config.Files.CgroupPath, "cpu.max"),
+			[]byte(fmt.Sprintf("%d 100000", cpuLimit)),
+			0644,
+		); err != nil {
+			return fmt.Errorf("failed to set cpu limit: %w", err)
+		}
+	}
+
+	// 设置内存限制
+	if j.config.Limits.Memory > 0 {
+		if err := os.WriteFile(
+			filepath.Join(j.config.Files.CgroupPath, "memory.max"),
+			[]byte(strconv.FormatInt(j.config.Limits.Memory*1024, 10)),
+			0644,
+		); err != nil {
+			return fmt.Errorf("failed to set memory limit: %w", err)
+		}
+	}
+
+	return nil
 }
