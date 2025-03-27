@@ -2,16 +2,16 @@ package judge
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/crazyfrankie/judge-go/constant"
 )
 
 // StdCheck 检查用户输出和标准输出是否一致
-func StdCheck(userOutputPath, stdOutputPath string) (int, error) {
+func StdCheck(userOutputPath string) (int, error) {
 	// 打开用户输出文件
 	userFile, err := os.Open(userOutputPath)
 	if err != nil {
@@ -19,45 +19,37 @@ func StdCheck(userOutputPath, stdOutputPath string) (int, error) {
 	}
 	defer userFile.Close()
 
-	// 打开标准输出文件
-	stdFile, err := os.Open(stdOutputPath)
-	if err != nil {
-		return constant.Fail, fmt.Errorf("failed to open standard output file: %w", err)
-	}
-	defer stdFile.Close()
-
 	// 创建读取器
-	userReader := bufio.NewReader(userFile)
-	stdReader := bufio.NewReader(stdFile)
+	reader := bufio.NewReader(userFile)
 
-	// 逐行比较
+	// 逐行读取并比较
 	for {
-		userLine, err1 := userReader.ReadBytes('\n')
-		stdLine, err2 := stdReader.ReadBytes('\n')
-
-		// 处理EOF
-		if err1 == io.EOF && err2 == io.EOF {
+		line, err := reader.ReadString('\n')
+		if err == io.EOF {
 			break
 		}
-		if err1 == io.EOF || err2 == io.EOF {
-			return constant.Fail, &constant.ContentErr{
-				Msg: "output length mismatch",
-			}
-		}
-		if err1 != nil || err2 != nil {
-			return constant.Fail, &constant.SystemErr{
-				Msg: fmt.Sprintf("error reading files: %v, %v", err1, err2),
-			}
+		if err != nil {
+			return constant.Fail, fmt.Errorf("error reading file: %w", err)
 		}
 
 		// 去除行尾空白字符
-		userLine = bytes.TrimSpace(userLine)
-		stdLine = bytes.TrimSpace(stdLine)
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
 
-		// 比较内容
-		if !bytes.Equal(userLine, stdLine) {
+		// 分割用户输出和标准输出
+		parts := strings.Split(line, " ")
+		if len(parts) != 2 {
 			return constant.Fail, &constant.ContentErr{
-				Msg: "content mismatch",
+				Msg: fmt.Sprintf("invalid line format: %s", line),
+			}
+		}
+
+		// 比较用户输出和标准输出
+		if parts[0] != parts[1] {
+			return constant.Fail, &constant.ContentErr{
+				Msg: fmt.Sprintf("output mismatch: got %s, want %s", parts[0], parts[1]),
 			}
 		}
 	}

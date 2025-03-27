@@ -45,7 +45,6 @@ type Config struct {
 	// 文件配置
 	Files struct {
 		UserOutput string
-		StdOutput  string
 		CgroupPath string
 	}
 }
@@ -233,7 +232,7 @@ func (j *Judge) monitorMemory(pid int) {
 
 // Check 检查输出结果
 func (j *Judge) Check() (int, error) {
-	return StdCheck(j.config.Files.UserOutput, j.config.Files.StdOutput)
+	return StdCheck(j.config.Files.UserOutput)
 }
 
 // Close 清理资源
